@@ -441,7 +441,7 @@ static void h2_stream_reset(HTTPContext *s)
     s->h2_stream_id = 0;
     s->h2_stream_closed = 0;
     s->http_code = 0;
-    s->filesize = -1;
+    s->filesize = UINT64_MAX;
     s->off = 0;
 }
 
@@ -2374,8 +2374,8 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
 
         /* Check if stream is closed */
         if (s->h2_stream_closed) {
-            /* Check for premature EOF (like HTTP/1.1 does) */
-            if (s->filesize > 0 && s->off < s->filesize) {
+            /* Check for premature EOF (like HTTP/1.1 does) - only if filesize is known */
+            if (s->filesize != UINT64_MAX && s->off < s->filesize) {
                 av_log(h, AV_LOG_ERROR,
                        "HTTP/2 stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
                        s->off, s->filesize);
@@ -2419,8 +2419,8 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
             }
         }
 
-        /* Final premature EOF check */
-        if (s->filesize > 0 && s->off < s->filesize) {
+        /* Final premature EOF check - only if filesize is known */
+        if (s->filesize != UINT64_MAX && s->off < s->filesize) {
             av_log(h, AV_LOG_ERROR,
                    "HTTP/2 stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
                    s->off, s->filesize);
