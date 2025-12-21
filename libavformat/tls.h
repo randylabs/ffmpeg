@@ -64,6 +64,18 @@ typedef struct TLSShared {
      * Note that pion requires a smaller value, for example, 1200.
      */
     int mtu;
+
+    /**
+     * ALPN protocol list (comma-separated), e.g., "h2,http/1.1"
+     * If set, ALPN negotiation will be performed during TLS handshake.
+     */
+    char *alpn;
+
+    /**
+     * The ALPN protocol selected by the server after handshake.
+     * This is read-only and set after successful TLS connection.
+     */
+    char *alpn_selected;
 } TLSShared;
 
 #define TLS_OPTFL (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
@@ -93,6 +105,8 @@ typedef struct TLSShared {
     {"mtu", "Maximum Transmission Unit", offsetof(pstruct, options_field . mtu), AV_OPT_TYPE_INT,  { .i64 = 0 }, 0, INT_MAX, .flags = TLS_OPTFL}, \
     {"cert_pem",   "Certificate PEM string",              offsetof(pstruct, options_field . cert_buf),  AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
     {"key_pem",    "Private key PEM string",              offsetof(pstruct, options_field . key_buf),   AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"alpn",       "ALPN protocols (comma-separated)",    offsetof(pstruct, options_field . alpn),      AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"alpn_selected", "Selected ALPN protocol",           offsetof(pstruct, options_field . alpn_selected), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY }, \
     FF_TLS_CLIENT_OPTIONS(pstruct, options_field)
 
 int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AVDictionary **options);

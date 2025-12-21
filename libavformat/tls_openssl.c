@@ -511,6 +511,7 @@ static int tls_close(URLContext *h)
         ffurl_closep(c->tls_shared.is_dtls ? &c->tls_shared.udp : &c->tls_shared.tcp);
     if (c->url_bio_method)
         BIO_meth_free(c->url_bio_method);
+    av_freep(&c->tls_shared.alpn_selected);
     return 0;
 }
 
@@ -864,6 +865,33 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         ret = AVERROR_EXTERNAL;
         goto fail;
     }
+
+    /* Set ALPN protocols if specified */
+    if (s->alpn && !s->listen) {
+        unsigned char alpn_wire[256];
+        size_t alpn_wire_len = 0;
+        const char *p = s->alpn;
+
+        while (*p && alpn_wire_len < sizeof(alpn_wire) - 1) {
+            const char *comma = strchr(p, ',');
+            size_t proto_len = comma ? (size_t)(comma - p) : strlen(p);
+
+            if (proto_len > 0 && proto_len < 256 &&
+                alpn_wire_len + proto_len + 1 < sizeof(alpn_wire)) {
+                alpn_wire[alpn_wire_len++] = (unsigned char)proto_len;
+                memcpy(alpn_wire + alpn_wire_len, p, proto_len);
+                alpn_wire_len += proto_len;
+            }
+            p = comma ? comma + 1 : p + proto_len;
+        }
+
+        if (alpn_wire_len > 0) {
+            if (SSL_CTX_set_alpn_protos(c->ctx, alpn_wire, alpn_wire_len) != 0) {
+                av_log(h, AV_LOG_WARNING, "Failed to set ALPN protocols\n");
+            }
+        }
+    }
+
     ret = openssl_init_ca_key_cert(h);
     if (ret < 0) goto fail;
 
@@ -901,6 +929,20 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     } else if (ret < 0) {
         ret = print_ssl_error(h, ret);
         goto fail;
+    }
+
+    /* Retrieve the selected ALPN protocol */
+    if (s->alpn && !s->listen) {
+        const unsigned char *alpn_data = NULL;
+        unsigned int alpn_len = 0;
+        SSL_get0_alpn_selected(c->ssl, &alpn_data, &alpn_len);
+        if (alpn_data && alpn_len > 0) {
+            av_freep(&s->alpn_selected);
+            s->alpn_selected = av_strndup((const char *)alpn_data, alpn_len);
+            if (s->alpn_selected) {
+                av_log(h, AV_LOG_DEBUG, "ALPN protocol selected: %s\n", s->alpn_selected);
+            }
+        }
     }
 
     return 0;

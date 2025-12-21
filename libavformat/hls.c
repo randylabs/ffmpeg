@@ -2769,13 +2769,6 @@ static int hls_probe(const AVProbeData *p)
             av_strcasecmp(p->mime_type, "application/x-mpegurl")
             );
 
-        if (!mime_ok &&
-            !mime_x &&
-            !av_match_ext    (p->filename, "m3u8,m3u") &&
-             ff_match_url_ext(p->filename, "m3u8,m3u") <= 0) {
-            av_log(NULL, AV_LOG_ERROR, "Not detecting m3u8/hls with non standard extension and non standard mime type\n");
-            return 0;
-        }
         if (mime_x)
             av_log(NULL, AV_LOG_WARNING, "mime type is not rfc8216 compliant\n");
 
@@ -2793,23 +2786,14 @@ static const AVOption hls_options[] = {
         OFFSET(prefer_x_start), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
     {"allowed_extensions", "List of file extensions that hls is allowed to access",
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
-        {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
-            ",cmfv,cmfa" // Ticket11526 www.nicovideo.jp
-            ",ec3"       // part of Ticket11435 (Elisa Viihde (Finnish online recording service))
-            ",fmp4"      // https://github.com/yt-dlp/yt-dlp/issues/12700
-        },
+        {.str = "ALL"},
         INT_MIN, INT_MAX, FLAGS},
     {"allowed_segment_extensions", "List of file extensions that hls is allowed to access",
         OFFSET(allowed_segment_extensions), AV_OPT_TYPE_STRING,
-        {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
-            ",cmfv,cmfa" // Ticket11526 www.nicovideo.jp
-            ",ec3"       // part of Ticket11435 (Elisa Viihde (Finnish online recording service))
-            ",fmp4"      // https://github.com/yt-dlp/yt-dlp/issues/12700
-            ",html"      // https://flash1.bogulus.cfd/
-        },
+        {.str = "ALL"},
         INT_MIN, INT_MAX, FLAGS},
     {"extension_picky", "Be picky with all extensions matching",
-        OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
+        OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",

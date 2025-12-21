@@ -248,6 +248,7 @@ External library support:
   --enable-libkvazaar      enable HEVC encoding via libkvazaar [no]
   --enable-liblc3          enable LC3 de/encoding via liblc3 [no]
   --enable-liblcevc-dec    enable LCEVC decoding via liblcevc-dec [no]
+  --enable-libnghttp2      enable HTTP/2 support via libnghttp2 [no]
   --enable-liblensfun      enable lensfun lens correction [no]
   --enable-libmodplug      enable ModPlug via libmodplug [no]
   --enable-libmp3lame      enable MP3 encoding via libmp3lame [no]
@@ -1986,6 +1987,7 @@ EXTERNAL_LIBRARY_LIST="
     libkvazaar
     liblc3
     liblcevc_dec
+    libnghttp2
     libmodplug
     libmp3lame
     libmysofa
@@ -3921,7 +3923,7 @@ ftp_protocol_select="tcp_protocol"
 gopher_protocol_select="tcp_protocol"
 gophers_protocol_select="tls_protocol"
 http_protocol_select="tcp_protocol"
-http_protocol_suggest="zlib"
+http_protocol_suggest="zlib libnghttp2"
 httpproxy_protocol_select="tcp_protocol"
 httpproxy_protocol_suggest="zlib"
 https_protocol_select="tls_protocol"
@@ -7173,6 +7175,7 @@ enabled libjxl            && require_pkg_config libjxl "libjxl >= 0.7.0" jxl/dec
 enabled libklvanc         && require libklvanc libklvanc/vanc.h klvanc_context_create -lklvanc
 enabled libkvazaar        && require_pkg_config libkvazaar "kvazaar >= 2.0.0" kvazaar.h kvz_api_get
 enabled liblc3            && require_pkg_config liblc3 "lc3 >= 1.1.0" lc3.h lc3_hr_setup_encoder
+enabled libnghttp2        && require_pkg_config libnghttp2 "libnghttp2 >= 1.0.0" nghttp2/nghttp2.h nghttp2_session_client_new
 enabled liblensfun        && require_pkg_config liblensfun lensfun lensfun.h lf_db_create
 enabled liblcevc_dec      && require_pkg_config liblcevc_dec "lcevc_dec >= 4.0.0" "LCEVC/lcevc_dec.h" LCEVC_CreateDecoder
 

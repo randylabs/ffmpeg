@@ -29,6 +29,9 @@
 #if CONFIG_ZLIB
 #include <zlib.h>
 #endif /* CONFIG_ZLIB */
+#if CONFIG_LIBNGHTTP2
+#include <nghttp2/nghttp2.h>
+#endif /* CONFIG_LIBNGHTTP2 */
 
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
@@ -146,6 +149,18 @@ typedef struct HTTPContext {
     unsigned int retry_after;
     int reconnect_max_retries;
     int reconnect_delay_total_max;
+#if CONFIG_LIBNGHTTP2
+    int http2;                  /**< Enable HTTP/2 support, -1 = auto, 0 = off, 1 = on */
+    int is_http2;               /**< Currently using HTTP/2 */
+    nghttp2_session *h2_session;
+    int32_t h2_stream_id;       /**< Current HTTP/2 stream ID */
+    uint8_t *h2_recv_buf;       /**< Buffer for received HTTP/2 data */
+    size_t h2_recv_buf_size;
+    size_t h2_recv_buf_len;
+    size_t h2_recv_buf_pos;
+    int h2_stream_closed;       /**< HTTP/2 stream has been closed */
+    int h2_goaway;              /**< Received GOAWAY frame */
+#endif /* CONFIG_LIBNGHTTP2 */
 } HTTPContext;
 
 #define OFFSET(x) offsetof(HTTPContext, x)
@@ -191,6 +206,9 @@ static const AVOption options[] = {
     { "resource", "The resource requested by a client", OFFSET(resource), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
     { "short_seek_size", "Threshold to favor readahead over seek.", OFFSET(short_seek_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
+#if CONFIG_LIBNGHTTP2
+    { "http2", "Enable HTTP/2 support", OFFSET(http2), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, D },
+#endif
     { NULL }
 };
 
@@ -199,6 +217,370 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
                         const char *proxyauth);
 static int http_read_header(URLContext *h);
 static int http_shutdown(URLContext *h, int flags);
+
+#if CONFIG_LIBNGHTTP2
+/* HTTP/2 buffer size for received data */
+#define H2_RECV_BUF_SIZE (256 * 1024)
+
+static ssize_t h2_send_callback(nghttp2_session *session,
+                                const uint8_t *data, size_t length,
+                                int flags, void *user_data)
+{
+    URLContext *h = user_data;
+    HTTPContext *s = h->priv_data;
+    int ret;
+
+    ret = ffurl_write(s->hd, data, length);
+    if (ret < 0) {
+        if (ret == AVERROR(EAGAIN))
+            return NGHTTP2_ERR_WOULDBLOCK;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return ret;
+}
+
+static int h2_on_header_callback(nghttp2_session *session,
+                                 const nghttp2_frame *frame,
+                                 const uint8_t *name, size_t namelen,
+                                 const uint8_t *value, size_t valuelen,
+                                 uint8_t flags, void *user_data)
+{
+    URLContext *h = user_data;
+    HTTPContext *s = h->priv_data;
+
+    if (frame->hd.type != NGHTTP2_HEADERS ||
+        frame->headers.cat != NGHTTP2_HCAT_RESPONSE)
+        return 0;
+
+    if (namelen == 7 && !memcmp(name, ":status", 7)) {
+        s->http_code = atoi((const char *)value);
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 status: %d\n", s->http_code);
+    } else if (namelen == 14 && !av_strncasecmp((const char *)name, "content-length", 14)) {
+        s->filesize = strtoull((const char *)value, NULL, 10);
+    } else if (namelen == 12 && !av_strncasecmp((const char *)name, "content-type", 12)) {
+        av_freep(&s->mime_type);
+        s->mime_type = av_strndup((const char *)value, valuelen);
+    } else if (namelen == 8 && !av_strncasecmp((const char *)name, "location", 8)) {
+        av_freep(&s->new_location);
+        s->new_location = av_strndup((const char *)value, valuelen);
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 location: %s\n", s->new_location);
+    }
+
+    return 0;
+}
+
+static int h2_on_data_chunk_recv_callback(nghttp2_session *session,
+                                          uint8_t flags, int32_t stream_id,
+                                          const uint8_t *data, size_t len,
+                                          void *user_data)
+{
+    URLContext *h = user_data;
+    HTTPContext *s = h->priv_data;
+
+    if (stream_id != s->h2_stream_id)
+        return 0;
+
+    /* Expand buffer if needed */
+    if (s->h2_recv_buf_len + len > s->h2_recv_buf_size) {
+        size_t new_size = s->h2_recv_buf_size ? s->h2_recv_buf_size * 2 : H2_RECV_BUF_SIZE;
+        while (new_size < s->h2_recv_buf_len + len)
+            new_size *= 2;
+        uint8_t *new_buf = av_realloc(s->h2_recv_buf, new_size);
+        if (!new_buf)
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        s->h2_recv_buf = new_buf;
+        s->h2_recv_buf_size = new_size;
+    }
+
+    memcpy(s->h2_recv_buf + s->h2_recv_buf_len, data, len);
+    s->h2_recv_buf_len += len;
+
+    return 0;
+}
+
+static int h2_on_stream_close_callback(nghttp2_session *session,
+                                       int32_t stream_id,
+                                       uint32_t error_code,
+                                       void *user_data)
+{
+    URLContext *h = user_data;
+    HTTPContext *s = h->priv_data;
+
+    if (stream_id == s->h2_stream_id) {
+        s->h2_stream_closed = 1;
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 stream %d closed with error code %u\n",
+               stream_id, error_code);
+    }
+
+    return 0;
+}
+
+static int h2_on_frame_recv_callback(nghttp2_session *session,
+                                     const nghttp2_frame *frame,
+                                     void *user_data)
+{
+    URLContext *h = user_data;
+    HTTPContext *s = h->priv_data;
+
+    if (frame->hd.type == NGHTTP2_GOAWAY) {
+        s->h2_goaway = 1;
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 GOAWAY received\n");
+    }
+
+    return 0;
+}
+
+static int h2_session_init(URLContext *h)
+{
+    HTTPContext *s = h->priv_data;
+    nghttp2_session_callbacks *callbacks;
+    int ret;
+
+    ret = nghttp2_session_callbacks_new(&callbacks);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to create nghttp2 callbacks\n");
+        return AVERROR(ENOMEM);
+    }
+
+    nghttp2_session_callbacks_set_send_callback(callbacks, h2_send_callback);
+    nghttp2_session_callbacks_set_on_header_callback(callbacks, h2_on_header_callback);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, h2_on_data_chunk_recv_callback);
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_on_stream_close_callback);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_on_frame_recv_callback);
+
+    ret = nghttp2_session_client_new(&s->h2_session, callbacks, h);
+    nghttp2_session_callbacks_del(callbacks);
+
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to create nghttp2 session\n");
+        return AVERROR(ENOMEM);
+    }
+
+    /* Send HTTP/2 connection preface */
+    ret = nghttp2_submit_settings(s->h2_session, NGHTTP2_FLAG_NONE, NULL, 0);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to submit settings\n");
+        nghttp2_session_del(s->h2_session);
+        s->h2_session = NULL;
+        return AVERROR(EIO);
+    }
+
+    /* Send the settings frame */
+    ret = nghttp2_session_send(s->h2_session);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to send HTTP/2 preface\n");
+        nghttp2_session_del(s->h2_session);
+        s->h2_session = NULL;
+        return AVERROR(EIO);
+    }
+
+    return 0;
+}
+
+static void h2_session_close(HTTPContext *s)
+{
+    if (s->h2_session) {
+        nghttp2_session_del(s->h2_session);
+        s->h2_session = NULL;
+    }
+    av_freep(&s->h2_recv_buf);
+    s->h2_recv_buf_size = 0;
+    s->h2_recv_buf_len = 0;
+    s->h2_recv_buf_pos = 0;
+    s->h2_stream_id = 0;
+    s->h2_stream_closed = 0;
+    s->h2_goaway = 0;
+    s->is_http2 = 0;
+    s->http_code = 0;
+}
+
+static int h2_recv_data(URLContext *h)
+{
+    HTTPContext *s = h->priv_data;
+    uint8_t buf[16384];
+    int ret;
+    ssize_t rv;
+
+    ret = ffurl_read(s->hd, buf, sizeof(buf));
+    if (ret < 0) {
+        if (ret == AVERROR(EAGAIN))
+            return 0;
+        return ret;
+    }
+    if (ret == 0)
+        return AVERROR_EOF;
+
+    rv = nghttp2_session_mem_recv(s->h2_session, buf, ret);
+    if (rv < 0) {
+        av_log(h, AV_LOG_ERROR, "nghttp2_session_mem_recv failed: %s\n",
+               nghttp2_strerror((int)rv));
+        return AVERROR(EIO);
+    }
+
+    /* Send any pending data (like WINDOW_UPDATE) */
+    ret = nghttp2_session_send(s->h2_session);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "nghttp2_session_send failed: %s\n",
+               nghttp2_strerror(ret));
+        return AVERROR(EIO);
+    }
+
+    return 0;
+}
+
+static int h2_submit_request(URLContext *h, const char *method,
+                             const char *authority, const char *path,
+                             const char *user_agent)
+{
+    HTTPContext *s = h->priv_data;
+    nghttp2_nv *hdrs = NULL;
+    int num_hdrs = 0;
+    int max_hdrs = 64;  /* Maximum number of headers */
+    int32_t stream_id;
+    int ret = 0;
+    char *headers_copy = NULL;
+    char **lowercase_names = NULL;
+    int num_custom_hdrs = 0;
+
+    hdrs = av_malloc_array(max_hdrs, sizeof(*hdrs));
+    if (!hdrs)
+        return AVERROR(ENOMEM);
+
+    lowercase_names = av_calloc(max_hdrs, sizeof(*lowercase_names));
+    if (!lowercase_names) {
+        av_free(hdrs);
+        return AVERROR(ENOMEM);
+    }
+
+#define ADD_HEADER(n, v) do { \
+    if (num_hdrs < max_hdrs) { \
+        hdrs[num_hdrs].name = (uint8_t *)(n); \
+        hdrs[num_hdrs].namelen = strlen(n); \
+        hdrs[num_hdrs].value = (uint8_t *)(v); \
+        hdrs[num_hdrs].valuelen = strlen(v); \
+        hdrs[num_hdrs].flags = NGHTTP2_NV_FLAG_NONE; \
+        num_hdrs++; \
+    } \
+} while(0)
+
+    /* Add pseudo-headers first (required by HTTP/2) */
+    ADD_HEADER(":method", method);
+    ADD_HEADER(":scheme", "https");
+    ADD_HEADER(":authority", authority);
+    ADD_HEADER(":path", path);
+
+    /* Parse and add custom headers from s->headers */
+    if (s->headers) {
+        char *header_line, *saveptr = NULL;
+        char *p, *q;
+        int has_user_agent = 0, has_accept = 0;
+
+        headers_copy = av_strdup(s->headers);
+        if (!headers_copy) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+
+        /* Convert literal \r\n sequences to actual newlines for parsing */
+        p = q = headers_copy;
+        while (*p) {
+            if (p[0] == '\\' && p[1] == 'r' && p[2] == '\\' && p[3] == 'n') {
+                *q++ = '\n';
+                p += 4;
+            } else if (p[0] == '\\' && p[1] == 'n') {
+                *q++ = '\n';
+                p += 2;
+            } else if (p[0] == '\\' && p[1] == 'r') {
+                p += 2;  /* Skip \r */
+            } else {
+                *q++ = *p++;
+            }
+        }
+        *q = '\0';
+
+        header_line = av_strtok(headers_copy, "\r\n", &saveptr);
+        while (header_line && num_hdrs < max_hdrs) {
+            char *colon = strchr(header_line, ':');
+            if (colon) {
+                char *name = header_line;
+                char *value = colon + 1;
+                size_t name_len = colon - header_line;
+
+                /* Skip leading whitespace in value */
+                while (*value == ' ' || *value == '\t')
+                    value++;
+
+                /* Create lowercase copy of header name for HTTP/2 */
+                lowercase_names[num_custom_hdrs] = av_malloc(name_len + 1);
+                if (!lowercase_names[num_custom_hdrs]) {
+                    ret = AVERROR(ENOMEM);
+                    goto end;
+                }
+                for (size_t i = 0; i < name_len; i++)
+                    lowercase_names[num_custom_hdrs][i] = av_tolower(name[i]);
+                lowercase_names[num_custom_hdrs][name_len] = '\0';
+
+                /* Check for user-agent and accept to avoid duplicates */
+                if (!strcmp(lowercase_names[num_custom_hdrs], "user-agent"))
+                    has_user_agent = 1;
+                if (!strcmp(lowercase_names[num_custom_hdrs], "accept"))
+                    has_accept = 1;
+
+                hdrs[num_hdrs].name = (uint8_t *)lowercase_names[num_custom_hdrs];
+                hdrs[num_hdrs].namelen = name_len;
+                hdrs[num_hdrs].value = (uint8_t *)value;
+                hdrs[num_hdrs].valuelen = strlen(value);
+                hdrs[num_hdrs].flags = NGHTTP2_NV_FLAG_NONE;
+                num_hdrs++;
+                num_custom_hdrs++;
+            }
+            header_line = av_strtok(NULL, "\r\n", &saveptr);
+        }
+
+        /* Add default headers only if not already present */
+        if (!has_user_agent && user_agent)
+            ADD_HEADER("user-agent", user_agent);
+        if (!has_accept)
+            ADD_HEADER("accept", "*/*");
+    } else {
+        /* No custom headers, add defaults */
+        if (user_agent)
+            ADD_HEADER("user-agent", user_agent);
+        ADD_HEADER("accept", "*/*");
+    }
+
+#undef ADD_HEADER
+
+    stream_id = nghttp2_submit_request(s->h2_session, NULL, hdrs, num_hdrs, NULL, h);
+    if (stream_id < 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to submit HTTP/2 request: %s\n",
+               nghttp2_strerror(stream_id));
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+    s->h2_stream_id = stream_id;
+    av_log(h, AV_LOG_DEBUG, "HTTP/2 request submitted on stream %d\n", stream_id);
+
+    /* Send the request */
+    ret = nghttp2_session_send(s->h2_session);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to send HTTP/2 request: %s\n",
+               nghttp2_strerror(ret));
+        ret = AVERROR(EIO);
+        goto end;
+    }
+    ret = 0;
+
+end:
+    av_free(hdrs);
+    av_free(headers_copy);
+    for (int i = 0; i < num_custom_hdrs; i++)
+        av_free(lowercase_names[i]);
+    av_free(lowercase_names);
+    return ret;
+}
+#endif /* CONFIG_LIBNGHTTP2 */
 
 void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
 {
@@ -253,6 +635,14 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
             if (err < 0)
                 goto end;
         }
+#if CONFIG_LIBNGHTTP2
+        /* Enable ALPN for HTTP/2 negotiation if enabled */
+        if (s->http2 != 0) {
+            err = av_dict_set(options, "alpn", "h2,http/1.1", 0);
+            if (err < 0)
+                goto end;
+        }
+#endif
     }
     if (port < 0)
         port = 80;
@@ -451,6 +841,9 @@ redo:
          s->http_code == 303 || s->http_code == 307 || s->http_code == 308) &&
         s->new_location) {
         /* url moved, get next */
+#if CONFIG_LIBNGHTTP2
+        h2_session_close(s);
+#endif
         ffurl_closep(&s->hd);
         if (redirects++ >= MAX_REDIRECTS)
             return AVERROR(EIO);
@@ -1486,6 +1879,56 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     const char *method;
     int send_expect_100 = 0;
 
+#if CONFIG_LIBNGHTTP2
+    /* Check if HTTP/2 was negotiated via ALPN */
+    if (s->http2 != 0 && s->hd) {
+        char *alpn_selected = NULL;
+        av_opt_get(s->hd->priv_data, "alpn_selected", 0, (uint8_t **)&alpn_selected);
+        if (alpn_selected && !strcmp(alpn_selected, "h2")) {
+            s->is_http2 = 1;
+            av_freep(&s->http_version);
+            s->http_version = av_strdup("2");
+            av_log(h, AV_LOG_INFO, "Using HTTP/2\n");
+
+            /* Initialize HTTP/2 session */
+            err = h2_session_init(h);
+            if (err < 0) {
+                av_free(alpn_selected);
+                return err;
+            }
+
+            /* Determine method */
+            post = h->flags & AVIO_FLAG_WRITE;
+            if (s->method)
+                method = s->method;
+            else
+                method = post ? "POST" : "GET";
+
+            /* Submit HTTP/2 request */
+            err = h2_submit_request(h, method, hoststr, path, s->user_agent);
+            av_free(alpn_selected);
+            if (err < 0)
+                return err;
+
+            /* Read response headers */
+            while (!s->h2_stream_closed && s->http_code == 0) {
+                err = h2_recv_data(h);
+                if (err < 0 && err != AVERROR_EOF)
+                    return err;
+                if (err == AVERROR_EOF)
+                    break;
+            }
+
+            s->off = off;
+            /* For redirect responses, always return 0 to allow redirect handling */
+            if (s->http_code >= 300 && s->http_code < 400)
+                return 0;
+            return (off == s->filesize) ? AVERROR_EOF : 0;
+        }
+        av_free(alpn_selected);
+    }
+#endif
+
     av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
 
     /* send http header */
@@ -1755,6 +2198,57 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
     if (!s->hd)
         return AVERROR_EOF;
 
+#if CONFIG_LIBNGHTTP2
+    /* HTTP/2 read path */
+    if (s->is_http2 && s->h2_session) {
+        size_t available;
+
+        /* Return data from buffer first */
+        available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
+        if (available > 0) {
+            size_t to_copy = FFMIN(available, (size_t)size);
+            memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
+            s->h2_recv_buf_pos += to_copy;
+            s->off += to_copy;
+
+            /* Compact buffer if we've consumed enough */
+            if (s->h2_recv_buf_pos > s->h2_recv_buf_len / 2) {
+                memmove(s->h2_recv_buf, s->h2_recv_buf + s->h2_recv_buf_pos,
+                        s->h2_recv_buf_len - s->h2_recv_buf_pos);
+                s->h2_recv_buf_len -= s->h2_recv_buf_pos;
+                s->h2_recv_buf_pos = 0;
+            }
+
+            return (int)to_copy;
+        }
+
+        /* Check if stream is closed */
+        if (s->h2_stream_closed)
+            return AVERROR_EOF;
+
+        /* Receive more data */
+        err = h2_recv_data(h);
+        if (err < 0)
+            return err;
+
+        /* Check again for available data */
+        available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
+        if (available > 0) {
+            size_t to_copy = FFMIN(available, (size_t)size);
+            memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
+            s->h2_recv_buf_pos += to_copy;
+            s->off += to_copy;
+            return (int)to_copy;
+        }
+
+        /* No data available yet, return EAGAIN for non-blocking */
+        if (h->flags & AVIO_FLAG_NONBLOCK)
+            return AVERROR(EAGAIN);
+
+        return 0;
+    }
+#endif /* CONFIG_LIBNGHTTP2 */
+
     if (s->end_chunked_post && !s->end_header) {
         err = http_read_header(h);
         if (err < 0)
@@ -1968,6 +2462,10 @@ static int http_close(URLContext *h)
     inflateEnd(&s->inflate_stream);
     av_freep(&s->inflate_buffer);
 #endif /* CONFIG_ZLIB */
+
+#if CONFIG_LIBNGHTTP2
+    h2_session_close(s);
+#endif /* CONFIG_LIBNGHTTP2 */
 
     if (s->hd && !s->end_chunked_post)
         /* Close the write direction by sending the end of chunked encoding. */
