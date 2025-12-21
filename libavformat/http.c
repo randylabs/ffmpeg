@@ -314,8 +314,8 @@ static int h2_on_stream_close_callback(nghttp2_session *session,
 
     if (stream_id == s->h2_stream_id) {
         s->h2_stream_closed = 1;
-        av_log(h, AV_LOG_DEBUG, "HTTP/2 stream %d closed with error code %u\n",
-               stream_id, error_code);
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 stream %d closed with error code %u, received %zu bytes\n",
+               stream_id, error_code, s->h2_recv_buf_len);
     }
 
     return 0;
@@ -398,6 +398,18 @@ static void h2_session_close(HTTPContext *s)
     s->h2_goaway = 0;
     s->is_http2 = 0;
     s->http_code = 0;
+}
+
+/* Reset HTTP/2 stream state for a new request while keeping the session */
+static void h2_stream_reset(HTTPContext *s)
+{
+    s->h2_recv_buf_len = 0;
+    s->h2_recv_buf_pos = 0;
+    s->h2_stream_id = 0;
+    s->h2_stream_closed = 0;
+    s->http_code = 0;
+    s->filesize = -1;
+    s->off = 0;
 }
 
 static int h2_recv_data(URLContext *h)
@@ -1886,21 +1898,34 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     int send_expect_100 = 0;
 
 #if CONFIG_LIBNGHTTP2
-    /* Check if HTTP/2 was negotiated via ALPN */
+    /* Check if HTTP/2 was negotiated via ALPN or session already exists */
     if (s->http2 != 0 && s->hd) {
         char *alpn_selected = NULL;
-        av_opt_get(s->hd->priv_data, "alpn_selected", 0, (uint8_t **)&alpn_selected);
-        if (alpn_selected && !strcmp(alpn_selected, "h2")) {
-            s->is_http2 = 1;
-            av_freep(&s->http_version);
-            s->http_version = av_strdup("2");
-            av_log(h, AV_LOG_INFO, "Using HTTP/2\n");
+        int need_new_session = 0;
 
-            /* Initialize HTTP/2 session */
-            err = h2_session_init(h);
-            if (err < 0) {
-                av_free(alpn_selected);
-                return err;
+        /* Check if we already have an HTTP/2 session */
+        if (s->h2_session && s->is_http2) {
+            /* Reuse existing session, just reset stream state */
+            h2_stream_reset(s);
+            av_log(h, AV_LOG_DEBUG, "Reusing HTTP/2 session\n");
+        } else {
+            av_opt_get(s->hd->priv_data, "alpn_selected", 0, (uint8_t **)&alpn_selected);
+            if (alpn_selected && !strcmp(alpn_selected, "h2")) {
+                need_new_session = 1;
+                s->is_http2 = 1;
+                av_freep(&s->http_version);
+                s->http_version = av_strdup("2");
+                av_log(h, AV_LOG_INFO, "Using HTTP/2\n");
+            }
+            av_free(alpn_selected);
+        }
+
+        if (s->is_http2) {
+            if (need_new_session) {
+                /* Initialize HTTP/2 session */
+                err = h2_session_init(h);
+                if (err < 0)
+                    return err;
             }
 
             /* Determine method */
@@ -1912,7 +1937,6 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
 
             /* Submit HTTP/2 request */
             err = h2_submit_request(h, method, hoststr, path, s->user_agent);
-            av_free(alpn_selected);
             if (err < 0)
                 return err;
 
@@ -1931,7 +1955,6 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
                 return 0;
             return (off == s->filesize) ? AVERROR_EOF : 0;
         }
-        av_free(alpn_selected);
     }
 #endif
 
