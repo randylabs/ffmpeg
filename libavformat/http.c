@@ -261,9 +261,42 @@ static int h2_on_header_callback(nghttp2_session *session,
         av_freep(&s->mime_type);
         s->mime_type = av_strndup((const char *)value, valuelen);
     } else if (namelen == 8 && !av_strncasecmp((const char *)name, "location", 8)) {
+        /* Resolve relative URLs against current location, like HTTP/1.1 does */
+        char redirected_location[MAX_URL_SIZE];
+        char *raw_location = av_strndup((const char *)value, valuelen);
+        if (!raw_location)
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        ff_make_absolute_url(redirected_location, sizeof(redirected_location),
+                             s->location, raw_location);
+        av_freep(&raw_location);
         av_freep(&s->new_location);
-        s->new_location = av_strndup((const char *)value, valuelen);
-        av_log(h, AV_LOG_DEBUG, "HTTP/2 location: %s\n", s->new_location);
+        s->new_location = av_strdup(redirected_location);
+        if (!s->new_location)
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 location: %s (resolved from %.*s)\n",
+               s->new_location, (int)valuelen, value);
+    } else if (namelen == 16 && !av_strncasecmp((const char *)name, "content-encoding", 16)) {
+        /* Handle compression like HTTP/1.1 does */
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 content-encoding: %.*s\n", (int)valuelen, value);
+#if CONFIG_ZLIB
+        if (!av_strncasecmp((const char *)value, "gzip", 4) ||
+            !av_strncasecmp((const char *)value, "deflate", 7)) {
+            s->compressed = 1;
+            inflateEnd(&s->inflate_stream);
+            if (inflateInit2(&s->inflate_stream, 32 + 15) != Z_OK) {
+                av_log(h, AV_LOG_WARNING, "Failed to init zlib for HTTP/2\n");
+                s->compressed = 0;
+            }
+        }
+#endif
+    } else if (namelen == 13 && !av_strncasecmp((const char *)name, "accept-ranges", 13)) {
+        /* Track if server supports range requests (for seeking) */
+        s->seekable = !av_strncasecmp((const char *)value, "bytes", 5) ? 1 : 0;
+    } else if (namelen == 10 && !av_strncasecmp((const char *)name, "set-cookie", 10)) {
+        /* Handle cookies like HTTP/1.1 */
+        if (!s->cookies) {
+            s->cookies = av_strndup((const char *)value, valuelen);
+        }
     }
 
     return 0;
@@ -2213,6 +2246,87 @@ static int http_buf_read_compressed(URLContext *h, uint8_t *buf, int size)
 }
 #endif /* CONFIG_ZLIB */
 
+#if CONFIG_LIBNGHTTP2
+/* Read raw bytes from HTTP/2 buffer (for use by compression) */
+static int h2_buf_read(URLContext *h, uint8_t *buf, int size)
+{
+    HTTPContext *s = h->priv_data;
+    size_t available;
+    int err;
+
+    /* Return data from buffer first */
+    available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
+    if (available > 0) {
+        size_t to_copy = FFMIN(available, (size_t)size);
+        memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
+        s->h2_recv_buf_pos += to_copy;
+        s->off += to_copy;
+
+        /* Compact buffer */
+        if (s->h2_recv_buf_pos > s->h2_recv_buf_len / 2) {
+            memmove(s->h2_recv_buf, s->h2_recv_buf + s->h2_recv_buf_pos,
+                    s->h2_recv_buf_len - s->h2_recv_buf_pos);
+            s->h2_recv_buf_len -= s->h2_recv_buf_pos;
+            s->h2_recv_buf_pos = 0;
+        }
+        return (int)to_copy;
+    }
+
+    if (s->h2_stream_closed)
+        return AVERROR_EOF;
+
+    /* Receive more data */
+    while (!s->h2_stream_closed) {
+        err = h2_recv_data(h);
+        if (err < 0)
+            return err;
+
+        available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
+        if (available > 0) {
+            size_t to_copy = FFMIN(available, (size_t)size);
+            memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
+            s->h2_recv_buf_pos += to_copy;
+            s->off += to_copy;
+            return (int)to_copy;
+        }
+    }
+
+    return AVERROR_EOF;
+}
+
+#if CONFIG_ZLIB
+static int h2_buf_read_compressed(URLContext *h, uint8_t *buf, int size)
+{
+    HTTPContext *s = h->priv_data;
+    int ret;
+
+    if (!s->inflate_buffer) {
+        s->inflate_buffer = av_malloc(DECOMPRESS_BUF_SIZE);
+        if (!s->inflate_buffer)
+            return AVERROR(ENOMEM);
+    }
+
+    if (s->inflate_stream.avail_in == 0) {
+        int read = h2_buf_read(h, s->inflate_buffer, DECOMPRESS_BUF_SIZE);
+        if (read <= 0)
+            return read;
+        s->inflate_stream.next_in  = s->inflate_buffer;
+        s->inflate_stream.avail_in = read;
+    }
+
+    s->inflate_stream.avail_out = size;
+    s->inflate_stream.next_out  = buf;
+
+    ret = inflate(&s->inflate_stream, Z_SYNC_FLUSH);
+    if (ret != Z_OK && ret != Z_STREAM_END)
+        av_log(h, AV_LOG_WARNING, "HTTP/2 inflate return value: %d, %s\n",
+               ret, s->inflate_stream.msg);
+
+    return size - s->inflate_stream.avail_out;
+}
+#endif /* CONFIG_ZLIB */
+#endif /* CONFIG_LIBNGHTTP2 */
+
 static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int force_reconnect);
 
 static int http_read_stream(URLContext *h, uint8_t *buf, int size)
@@ -2231,11 +2345,18 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
     /* HTTP/2 read path */
     if (s->is_http2 && s->h2_session) {
         size_t available;
+        size_t to_copy;
+
+#if CONFIG_ZLIB
+        /* Handle compressed content using HTTP/2 specific decompression */
+        if (s->compressed)
+            return h2_buf_read_compressed(h, buf, size);
+#endif
 
         /* Return data from buffer first */
         available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
         if (available > 0) {
-            size_t to_copy = FFMIN(available, (size_t)size);
+            to_copy = FFMIN(available, (size_t)size);
             memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
             s->h2_recv_buf_pos += to_copy;
             s->off += to_copy;
@@ -2252,8 +2373,16 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
         }
 
         /* Check if stream is closed */
-        if (s->h2_stream_closed)
+        if (s->h2_stream_closed) {
+            /* Check for premature EOF (like HTTP/1.1 does) */
+            if (s->filesize > 0 && s->off < s->filesize) {
+                av_log(h, AV_LOG_ERROR,
+                       "HTTP/2 stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
+                       s->off, s->filesize);
+                return AVERROR(EIO);
+            }
             return AVERROR_EOF;
+        }
 
         /* Receive more data */
         err = h2_recv_data(h);
@@ -2263,7 +2392,7 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
         /* Check again for available data */
         available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
         if (available > 0) {
-            size_t to_copy = FFMIN(available, (size_t)size);
+            to_copy = FFMIN(available, (size_t)size);
             memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
             s->h2_recv_buf_pos += to_copy;
             s->off += to_copy;
@@ -2282,7 +2411,7 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
 
             available = s->h2_recv_buf_len - s->h2_recv_buf_pos;
             if (available > 0) {
-                size_t to_copy = FFMIN(available, (size_t)size);
+                to_copy = FFMIN(available, (size_t)size);
                 memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
                 s->h2_recv_buf_pos += to_copy;
                 s->off += to_copy;
@@ -2290,6 +2419,13 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
             }
         }
 
+        /* Final premature EOF check */
+        if (s->filesize > 0 && s->off < s->filesize) {
+            av_log(h, AV_LOG_ERROR,
+                   "HTTP/2 stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
+                   s->off, s->filesize);
+            return AVERROR(EIO);
+        }
         return AVERROR_EOF;
     }
 #endif /* CONFIG_LIBNGHTTP2 */
