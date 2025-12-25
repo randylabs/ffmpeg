@@ -12,7 +12,7 @@ WORKDIR="${WORKDIR:-$PWD/.deps-build}"
 
 mkdir -p "$PREFIX" "$WORKDIR"
 
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib/aarch64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PREFIX/lib/aarch64-linux-gnu/pkgconfig:$PREFIX/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CFLAGS="${CFLAGS:-} -fPIC"
 export CXXFLAGS="${CXXFLAGS:-} -fPIC"
 export PATH="$HOME/.local/bin:$PATH"
@@ -102,7 +102,7 @@ for pkg in "$@"; do
       build_cmake "oneVPL" "https://github.com/oneapi-src/oneVPL.git"
       ;;
     libchromaprint-dev)
-      build_cmake "chromaprint" "https://github.com/acoustid/chromaprint.git" -DBUILD_TOOLS=OFF -DBUILD_TESTS=OFF
+      build_cmake "chromaprint" "https://github.com/acoustid/chromaprint.git" -DBUILD_TOOLS=OFF -DBUILD_TESTS=OFF -DFFT_LIB=kissfft
       ;;
     libvapoursynth-dev)
       build_meson "vapoursynth" "https://github.com/vapoursynth/vapoursynth.git"
