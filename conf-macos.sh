@@ -2,7 +2,6 @@
 
 ./configure \
       --prefix=/opt/ffmpeg \
-      --enable-shared \
       --enable-pthreads \
       --enable-version3 \
       --cc=/usr/bin/clang \
