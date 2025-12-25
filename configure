@@ -6011,7 +6011,7 @@ case $target_os in
             is_in -isysroot $ld $LDFLAGS          || check_ldflags  -isysroot $sysroot
         fi
         version_script='-exported_symbols_list'
-        VERSION_SCRIPT_POSTPROCESS_CMD='tr " " "\n" | sed -n /global:/,/local:/p | grep ";" | tr ";" "\n" | sed -E "s/(.+)/_\1/g" | sed -E "s/(.+[^*])$$$$/\1*/"'
+        VERSION_SCRIPT_POSTPROCESS_CMD='tr " " "\n" | sed -n "/global:/,/local:/p" | grep ";" | tr ";" "\n" | sed -E "s/(.+)/_\1/g" | sed -E "s/(.+[^*])$$$$/\1*/"'
         # Workaround for Xcode 11 -fstack-check bug
         if enabled clang; then
             clang_version=$($cc -dumpversion)
