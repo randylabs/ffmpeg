@@ -239,6 +239,9 @@ static ssize_t h2_send_callback(nghttp2_session *session,
     return ret;
 }
 
+/* Forward declaration - defined at line ~1358 */
+static void parse_content_range(URLContext *h, const char *p);
+
 static int h2_on_header_callback(nghttp2_session *session,
                                  const nghttp2_frame *frame,
                                  const uint8_t *name, size_t namelen,
@@ -297,6 +300,17 @@ static int h2_on_header_callback(nghttp2_session *session,
         if (!s->cookies) {
             s->cookies = av_strndup((const char *)value, valuelen);
         }
+    } else if (namelen == 13 && !av_strncasecmp((const char *)name, "content-range", 13)) {
+        /* Parse Content-Range header for seek support.
+         * Format: "bytes $from-$to/$total" or "bytes $from-$to/ *" (unknown size)
+         * This mirrors parse_content_range() used by HTTP/1.1. */
+        char range_str[128];
+        size_t copy_len = FFMIN(valuelen, sizeof(range_str) - 1);
+        memcpy(range_str, value, copy_len);
+        range_str[copy_len] = '\0';
+        parse_content_range(h, range_str);
+        av_log(h, AV_LOG_DEBUG, "HTTP/2 Content-Range: %s (off=%"PRIu64")\n",
+               range_str, s->off);
     }
 
     return 0;
@@ -433,7 +447,9 @@ static void h2_session_close(HTTPContext *s)
     s->http_code = 0;
 }
 
-/* Reset HTTP/2 stream state for a new request while keeping the session */
+/* Reset HTTP/2 stream state for a new request while keeping the session.
+ * NOTE: s->off is NOT reset here - it contains the seek target position
+ * and will be updated from the Content-Range response header. */
 static void h2_stream_reset(HTTPContext *s)
 {
     s->h2_recv_buf_len = 0;
@@ -442,7 +458,6 @@ static void h2_stream_reset(HTTPContext *s)
     s->h2_stream_closed = 0;
     s->http_code = 0;
     s->filesize = UINT64_MAX;
-    s->off = 0;
 }
 
 static int h2_recv_data(URLContext *h)
@@ -481,7 +496,8 @@ static int h2_recv_data(URLContext *h)
 
 static int h2_submit_request(URLContext *h, const char *method,
                              const char *authority, const char *path,
-                             const char *user_agent)
+                             const char *user_agent,
+                             uint64_t range_start, uint64_t range_end)
 {
     HTTPContext *s = h->priv_data;
     nghttp2_nv *hdrs = NULL;
@@ -492,6 +508,7 @@ static int h2_submit_request(URLContext *h, const char *method,
     char *headers_copy = NULL;
     char **lowercase_names = NULL;
     int num_custom_hdrs = 0;
+    char *range_value = NULL;
 
     hdrs = av_malloc_array(max_hdrs, sizeof(*hdrs));
     if (!hdrs)
@@ -519,6 +536,27 @@ static int h2_submit_request(URLContext *h, const char *method,
     ADD_HEADER(":scheme", "https");
     ADD_HEADER(":authority", authority);
     ADD_HEADER(":path", path);
+
+    /* Add Range header for seeking (mirrors HTTP/1.1 logic at lines 2068-2076) */
+    {
+        int is_post = !strcmp(method, "POST") || !strcmp(method, "PUT");
+        int has_custom_range = s->headers && av_stristr(s->headers, "Range:");
+        if (!is_post && !has_custom_range &&
+            (range_start > 0 || range_end > 0 || s->seekable != 0)) {
+            range_value = av_malloc(64);
+            if (!range_value) {
+                ret = AVERROR(ENOMEM);
+                goto end;
+            }
+            if (range_end > 0)
+                snprintf(range_value, 64, "bytes=%"PRIu64"-%"PRIu64,
+                         range_start, range_end - 1);
+            else
+                snprintf(range_value, 64, "bytes=%"PRIu64"-", range_start);
+            ADD_HEADER("range", range_value);
+            av_log(h, AV_LOG_DEBUG, "HTTP/2 Range: %s\n", range_value);
+        }
+    }
 
     /* Parse and add custom headers from s->headers */
     if (s->headers) {
@@ -626,6 +664,7 @@ static int h2_submit_request(URLContext *h, const char *method,
 end:
     av_free(hdrs);
     av_free(headers_copy);
+    av_free(range_value);
     for (int i = 0; i < num_custom_hdrs; i++)
         av_free(lowercase_names[i]);
     av_free(lowercase_names);
@@ -1959,9 +1998,10 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
                 if (err < 0)
                     return err;
 
-                /* Initialize stream state for new session (like HTTP/1.1 does below) */
-                s->off = 0;
-                off = 0;  /* Update local variable to match */
+                /* Initialize stream state for new session.
+                 * NOTE: s->off and 'off' are NOT reset - they contain the seek
+                 * target position. The offset will be used for the Range header
+                 * and then updated from the Content-Range response. */
                 s->filesize = UINT64_MAX;
                 s->filesize_from_content_range = UINT64_MAX;
                 s->h2_recv_buf_len = 0;
@@ -1977,8 +2017,8 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
             else
                 method = post ? "POST" : "GET";
 
-            /* Submit HTTP/2 request */
-            err = h2_submit_request(h, method, hoststr, path, s->user_agent);
+            /* Submit HTTP/2 request with Range header for seeking */
+            err = h2_submit_request(h, method, hoststr, path, s->user_agent, off, s->end_off);
             if (err < 0)
                 return err;
 
@@ -1991,11 +2031,33 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
                     break;
             }
 
-            s->off = off;
+            /* Validate range request response */
+            if (off > 0) {
+                if (s->http_code == 200) {
+                    /* Server returned 200 instead of 206 - Range request ignored.
+                     * This means the server doesn't support byte ranges. */
+                    av_log(h, AV_LOG_WARNING,
+                           "HTTP/2: Server ignored Range request (200 instead of 206)\n");
+                    h->is_streamed = 1;  /* Mark as non-seekable */
+                    s->off = 0;  /* Data starts from beginning, not requested offset */
+                } else if (s->http_code == 206) {
+                    /* Range honored - s->off was set by Content-Range parsing.
+                     * Verify it matches what we requested. */
+                    if (s->off != off) {
+                        av_log(h, AV_LOG_DEBUG,
+                               "HTTP/2: Server returned offset %"PRIu64" (requested %"PRIu64")\n",
+                               s->off, off);
+                    }
+                }
+            } else {
+                /* No range requested - normal response, offset starts at 0 */
+                s->off = 0;
+            }
+
             /* For redirect responses, always return 0 to allow redirect handling */
             if (s->http_code >= 300 && s->http_code < 400)
                 return 0;
-            return (off == s->filesize) ? AVERROR_EOF : 0;
+            return (s->off == s->filesize) ? AVERROR_EOF : 0;
         }
     }
 #endif
