@@ -297,6 +297,15 @@ static int h2_on_header_callback(nghttp2_session *session,
         if (!s->cookies) {
             s->cookies = av_strndup((const char *)value, valuelen);
         }
+    } else if (namelen == 16 && !av_strncasecmp((const char *)name, "www-authenticate", 16)) {
+        /* Handle WWW-Authenticate for 401 responses (like HTTP/1.1 does) */
+        ff_http_auth_handle_header(&s->auth_state, "WWW-Authenticate", (const char *)value);
+    } else if (namelen == 18 && !av_strncasecmp((const char *)name, "proxy-authenticate", 18)) {
+        /* Handle Proxy-Authenticate for 407 responses (like HTTP/1.1 does) */
+        ff_http_auth_handle_header(&s->proxy_auth_state, "Proxy-Authenticate", (const char *)value);
+    } else if (namelen == 11 && !av_strncasecmp((const char *)name, "retry-after", 11)) {
+        /* Handle Retry-After header for reconnection delays */
+        s->retry_after = strtoul((const char *)value, NULL, 10);
     }
 
     return 0;
@@ -875,6 +884,9 @@ redo:
     if (s->http_code == 401) {
         if ((cur_auth_type == HTTP_AUTH_NONE || s->auth_state.stale) &&
             s->auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 4) {
+#if CONFIG_LIBNGHTTP2
+            h2_session_close(s);
+#endif
             ffurl_closep(&s->hd);
             goto redo;
         } else
@@ -883,6 +895,9 @@ redo:
     if (s->http_code == 407) {
         if ((cur_proxy_auth_type == HTTP_AUTH_NONE || s->proxy_auth_state.stale) &&
             s->proxy_auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 4) {
+#if CONFIG_LIBNGHTTP2
+            h2_session_close(s);
+#endif
             ffurl_closep(&s->hd);
             goto redo;
         } else
@@ -1305,6 +1320,27 @@ static int check_http_code(URLContext *h, int http_code, const char *end)
     }
     return 0;
 }
+
+#if CONFIG_LIBNGHTTP2
+/**
+ * Validate HTTP/2 status code and return appropriate error.
+ * Unlike check_http_code(), this doesn't take an 'end' parameter since
+ * HTTP/2 uses pseudo-headers without reason phrases.
+ */
+static int check_http2_code(URLContext *h, int http_code)
+{
+    HTTPContext *s = h->priv_data;
+    /* error codes are 4xx and 5xx, but regard 401 as a success, so we
+     * don't abort until all headers have been parsed. */
+    if (http_code >= 400 && http_code < 600 &&
+        (http_code != 401 || s->auth_state.auth_type != HTTP_AUTH_NONE) &&
+        (http_code != 407 || s->proxy_auth_state.auth_type != HTTP_AUTH_NONE)) {
+        av_log(h, AV_LOG_WARNING, "HTTP/2 error %d\n", http_code);
+        return ff_http_averror(http_code, AVERROR(EIO));
+    }
+    return 0;
+}
+#endif /* CONFIG_LIBNGHTTP2 */
 
 static int parse_location(HTTPContext *s, const char *p)
 {
@@ -1992,9 +2028,20 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
             }
 
             s->off = off;
-            /* For redirect responses, always return 0 to allow redirect handling */
-            if (s->http_code >= 300 && s->http_code < 400)
+
+            /* Validate HTTP/2 status code - mirrors HTTP/1.1 behavior */
+            if (s->http_code > 0) {
+                err = check_http2_code(h, s->http_code);
+                if (err < 0)
+                    return err;
+            }
+
+            /* For redirect/auth responses, return 0 to allow retry handling
+             * in http_open_cnx() - same as HTTP/1.1 */
+            if ((s->http_code >= 300 && s->http_code < 400 && s->new_location) ||
+                s->http_code == 401 || s->http_code == 407)
                 return 0;
+
             return (off == s->filesize) ? AVERROR_EOF : 0;
         }
     }
