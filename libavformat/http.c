@@ -319,8 +319,11 @@ static int h2_on_data_chunk_recv_callback(nghttp2_session *session,
     URLContext *h = user_data;
     HTTPContext *s = h->priv_data;
 
-    if (stream_id != s->h2_stream_id)
+    if (stream_id != s->h2_stream_id) {
+        /* Data for old/other stream - still consume connection window to prevent leakage */
+        nghttp2_session_consume_connection(s->h2_session, len);
         return 0;
+    }
 
     /* Debug: log first bytes of first chunk */
     if (s->h2_recv_buf_len == 0 && len >= 8) {
@@ -378,15 +381,36 @@ static int h2_on_frame_recv_callback(nghttp2_session *session,
     return 0;
 }
 
+/* HTTP/2 window sizes - use large values for streaming media */
+#define H2_INITIAL_WINDOW_SIZE (16 * 1024 * 1024)  /* 16 MB per stream */
+#define H2_CONNECTION_WINDOW_SIZE (32 * 1024 * 1024)  /* 32 MB connection-level */
+
 static int h2_session_init(URLContext *h)
 {
     HTTPContext *s = h->priv_data;
     nghttp2_session_callbacks *callbacks;
+    nghttp2_option *options;
+    nghttp2_settings_entry settings[3];
     int ret;
+
+    /* Create session options */
+    ret = nghttp2_option_new(&options);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to create nghttp2 options\n");
+        return AVERROR(ENOMEM);
+    }
+
+    /*
+     * Disable automatic WINDOW_UPDATE - we'll send them manually when data
+     * is actually consumed from our buffer. This gives us precise control
+     * over flow control and prevents the server from overwhelming us.
+     */
+    nghttp2_option_set_no_auto_window_update(options, 1);
 
     ret = nghttp2_session_callbacks_new(&callbacks);
     if (ret != 0) {
         av_log(h, AV_LOG_ERROR, "Failed to create nghttp2 callbacks\n");
+        nghttp2_option_del(options);
         return AVERROR(ENOMEM);
     }
 
@@ -396,31 +420,70 @@ static int h2_session_init(URLContext *h)
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_on_stream_close_callback);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_on_frame_recv_callback);
 
-    ret = nghttp2_session_client_new(&s->h2_session, callbacks, h);
+    ret = nghttp2_session_client_new2(&s->h2_session, callbacks, h, options);
     nghttp2_session_callbacks_del(callbacks);
+    nghttp2_option_del(options);
 
     if (ret != 0) {
         av_log(h, AV_LOG_ERROR, "Failed to create nghttp2 session\n");
         return AVERROR(ENOMEM);
     }
 
-    /* Send HTTP/2 connection preface */
-    ret = nghttp2_submit_settings(s->h2_session, NGHTTP2_FLAG_NONE, NULL, 0);
+    /*
+     * Configure HTTP/2 settings for optimal streaming performance:
+     * - INITIAL_WINDOW_SIZE: 16MB per stream (default is only 64KB!)
+     *   The default 64KB window causes severe throughput issues for video
+     *   streaming as the server must wait for WINDOW_UPDATE frames frequently.
+     * - ENABLE_PUSH: Disabled since FFmpeg doesn't use server push
+     * - MAX_CONCURRENT_STREAMS: Allow multiple streams for segment downloads
+     */
+    settings[0].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
+    settings[0].value = H2_INITIAL_WINDOW_SIZE;
+
+    settings[1].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
+    settings[1].value = 0;  /* Disable server push */
+
+    settings[2].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
+    settings[2].value = 100;
+
+    ret = nghttp2_submit_settings(s->h2_session, NGHTTP2_FLAG_NONE,
+                                  settings, FF_ARRAY_ELEMS(settings));
     if (ret != 0) {
-        av_log(h, AV_LOG_ERROR, "Failed to submit settings\n");
+        av_log(h, AV_LOG_ERROR, "Failed to submit settings: %s\n",
+               nghttp2_strerror(ret));
         nghttp2_session_del(s->h2_session);
         s->h2_session = NULL;
         return AVERROR(EIO);
     }
 
-    /* Send the settings frame */
-    ret = nghttp2_session_send(s->h2_session);
+    /*
+     * Increase the connection-level window size.
+     * The initial connection window is 64KB by default, which is far too small
+     * for streaming. We increase it to 32MB to allow high-bandwidth transfers.
+     * The delta is (target - default) = 32MB - 64KB.
+     */
+    ret = nghttp2_submit_window_update(s->h2_session, NGHTTP2_FLAG_NONE, 0,
+                                       H2_CONNECTION_WINDOW_SIZE - NGHTTP2_INITIAL_WINDOW_SIZE);
     if (ret != 0) {
-        av_log(h, AV_LOG_ERROR, "Failed to send HTTP/2 preface\n");
+        av_log(h, AV_LOG_ERROR, "Failed to submit window update: %s\n",
+               nghttp2_strerror(ret));
         nghttp2_session_del(s->h2_session);
         s->h2_session = NULL;
         return AVERROR(EIO);
     }
+
+    /* Send the settings and window update frames */
+    ret = nghttp2_session_send(s->h2_session);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "Failed to send HTTP/2 preface: %s\n",
+               nghttp2_strerror(ret));
+        nghttp2_session_del(s->h2_session);
+        s->h2_session = NULL;
+        return AVERROR(EIO);
+    }
+
+    av_log(h, AV_LOG_DEBUG, "HTTP/2 session initialized with %d MB stream window, %d MB connection window\n",
+           H2_INITIAL_WINDOW_SIZE / (1024 * 1024), H2_CONNECTION_WINDOW_SIZE / (1024 * 1024));
 
     return 0;
 }
@@ -445,6 +508,16 @@ static void h2_session_close(HTTPContext *s)
 /* Reset HTTP/2 stream state for a new request while keeping the session */
 static void h2_stream_reset(HTTPContext *s)
 {
+    /* Consume any remaining buffered data to prevent window leakage.
+     * Data in the buffer was already counted by nghttp2, so we must
+     * send WINDOW_UPDATE before discarding it. */
+    size_t remaining = s->h2_recv_buf_len - s->h2_recv_buf_pos;
+    if (remaining > 0 && s->h2_session && s->h2_stream_id > 0) {
+        nghttp2_session_consume_stream(s->h2_session, s->h2_stream_id, remaining);
+        nghttp2_session_consume_connection(s->h2_session, remaining);
+        nghttp2_session_send(s->h2_session);
+    }
+
     s->h2_recv_buf_len = 0;
     s->h2_recv_buf_pos = 0;
     s->h2_stream_id = 0;
@@ -452,12 +525,19 @@ static void h2_stream_reset(HTTPContext *s)
     s->http_code = 0;
     s->filesize = UINT64_MAX;
     s->off = 0;
+#if CONFIG_ZLIB
+    s->compressed = 0;
+    s->inflate_stream.avail_in = 0;
+#endif
 }
+
+/* Larger read buffer for better throughput - matches HTTP/2 frame size */
+#define H2_READ_BUF_SIZE (64 * 1024)
 
 static int h2_recv_data(URLContext *h)
 {
     HTTPContext *s = h->priv_data;
-    uint8_t buf[16384];
+    uint8_t buf[H2_READ_BUF_SIZE];
     int ret;
     ssize_t rv;
 
@@ -477,7 +557,45 @@ static int h2_recv_data(URLContext *h)
         return AVERROR(EIO);
     }
 
-    /* Send any pending data (like WINDOW_UPDATE) */
+    /* Send any pending data (like WINDOW_UPDATE, PING ACK, etc.) */
+    ret = nghttp2_session_send(s->h2_session);
+    if (ret != 0) {
+        av_log(h, AV_LOG_ERROR, "nghttp2_session_send failed: %s\n",
+               nghttp2_strerror(ret));
+        return AVERROR(EIO);
+    }
+
+    return 0;
+}
+
+/**
+ * Notify nghttp2 that data has been consumed from the receive buffer.
+ * This allows nghttp2 to send WINDOW_UPDATE frames to the server,
+ * enabling it to send more data.
+ */
+static int h2_consume_data(URLContext *h, size_t consumed)
+{
+    HTTPContext *s = h->priv_data;
+    int ret;
+
+    if (!s->h2_session || consumed == 0)
+        return 0;
+
+    /* Tell nghttp2 we've consumed data from the stream */
+    ret = nghttp2_session_consume_stream(s->h2_session, s->h2_stream_id, consumed);
+    if (ret < 0 && ret != NGHTTP2_ERR_INVALID_ARGUMENT) {
+        av_log(h, AV_LOG_WARNING, "nghttp2_session_consume_stream failed: %s\n",
+               nghttp2_strerror(ret));
+    }
+
+    /* Also consume from connection-level window */
+    ret = nghttp2_session_consume_connection(s->h2_session, consumed);
+    if (ret < 0 && ret != NGHTTP2_ERR_INVALID_ARGUMENT) {
+        av_log(h, AV_LOG_WARNING, "nghttp2_session_consume_connection failed: %s\n",
+               nghttp2_strerror(ret));
+    }
+
+    /* Send WINDOW_UPDATE frames if needed */
     ret = nghttp2_session_send(s->h2_session);
     if (ret != 0) {
         av_log(h, AV_LOG_ERROR, "nghttp2_session_send failed: %s\n",
@@ -2318,6 +2436,9 @@ static int h2_buf_read(URLContext *h, uint8_t *buf, int size)
         s->h2_recv_buf_pos += to_copy;
         s->off += to_copy;
 
+        /* Notify nghttp2 that data was consumed - this triggers WINDOW_UPDATE */
+        h2_consume_data(h, to_copy);
+
         /* Compact buffer */
         if (s->h2_recv_buf_pos > s->h2_recv_buf_len / 2) {
             memmove(s->h2_recv_buf, s->h2_recv_buf + s->h2_recv_buf_pos,
@@ -2343,6 +2464,10 @@ static int h2_buf_read(URLContext *h, uint8_t *buf, int size)
             memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
             s->h2_recv_buf_pos += to_copy;
             s->off += to_copy;
+
+            /* Notify nghttp2 that data was consumed - this triggers WINDOW_UPDATE */
+            h2_consume_data(h, to_copy);
+
             return (int)to_copy;
         }
     }
@@ -2417,6 +2542,9 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
             s->h2_recv_buf_pos += to_copy;
             s->off += to_copy;
 
+            /* Notify nghttp2 that data was consumed - this triggers WINDOW_UPDATE */
+            h2_consume_data(h, to_copy);
+
             /* Compact buffer if we've consumed enough */
             if (s->h2_recv_buf_pos > s->h2_recv_buf_len / 2) {
                 memmove(s->h2_recv_buf, s->h2_recv_buf + s->h2_recv_buf_pos,
@@ -2452,6 +2580,10 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
             memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
             s->h2_recv_buf_pos += to_copy;
             s->off += to_copy;
+
+            /* Notify nghttp2 that data was consumed - this triggers WINDOW_UPDATE */
+            h2_consume_data(h, to_copy);
+
             return (int)to_copy;
         }
 
@@ -2471,6 +2603,10 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
                 memcpy(buf, s->h2_recv_buf + s->h2_recv_buf_pos, to_copy);
                 s->h2_recv_buf_pos += to_copy;
                 s->off += to_copy;
+
+                /* Notify nghttp2 that data was consumed - this triggers WINDOW_UPDATE */
+                h2_consume_data(h, to_copy);
+
                 return (int)to_copy;
             }
         }
