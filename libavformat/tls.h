@@ -76,6 +76,42 @@ typedef struct TLSShared {
      * This is read-only and set after successful TLS connection.
      */
     char *alpn_selected;
+
+    /**
+     * TLS fingerprint randomization mode:
+     * 0 = off, 1 = ciphers only, 2 = groups only, 3 = ciphers+groups, 4 = full
+     */
+    int fp_randomize;
+
+    /**
+     * TLS 1.2 cipher suites (colon-separated OpenSSL format).
+     * Example: "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256"
+     */
+    char *ciphers;
+
+    /**
+     * TLS 1.3 cipher suites (colon-separated OpenSSL format).
+     * Example: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+     */
+    char *ciphersuites;
+
+    /**
+     * Elliptic curve groups (colon-separated OpenSSL format).
+     * Example: "X25519:P-256:P-384"
+     */
+    char *groups;
+
+    /**
+     * Signature algorithms (colon-separated OpenSSL format).
+     * Example: "ECDSA+SHA256:RSA+SHA256"
+     */
+    char *sigalgs;
+
+    /**
+     * Random seed for fingerprint randomization.
+     * -1 = use random seed each connection, otherwise use specified seed.
+     */
+    int64_t fp_seed;
 } TLSShared;
 
 #define TLS_OPTFL (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
@@ -107,6 +143,12 @@ typedef struct TLSShared {
     {"key_pem",    "Private key PEM string",              offsetof(pstruct, options_field . key_buf),   AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
     {"alpn",       "ALPN protocols (comma-separated)",    offsetof(pstruct, options_field . alpn),      AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
     {"alpn_selected", "Selected ALPN protocol",           offsetof(pstruct, options_field . alpn_selected), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY }, \
+    {"fp_randomize", "TLS fingerprint randomization (0=off, 1=ciphers, 2=groups, 3=both, 4=full)", offsetof(pstruct, options_field . fp_randomize), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 4, .flags = TLS_OPTFL }, \
+    {"ciphers",    "TLS 1.2 cipher suites (colon-separated)", offsetof(pstruct, options_field . ciphers), AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"ciphersuites", "TLS 1.3 cipher suites (colon-separated)", offsetof(pstruct, options_field . ciphersuites), AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"groups",     "Elliptic curve groups (colon-separated)", offsetof(pstruct, options_field . groups), AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"sigalgs",    "Signature algorithms (colon-separated)", offsetof(pstruct, options_field . sigalgs), AV_OPT_TYPE_STRING, .flags = TLS_OPTFL }, \
+    {"fp_seed",    "Random seed for fingerprint randomization (-1=random)", offsetof(pstruct, options_field . fp_seed), AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, INT64_MAX, .flags = TLS_OPTFL }, \
     FF_TLS_CLIENT_OPTIONS(pstruct, options_field)
 
 int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AVDictionary **options);

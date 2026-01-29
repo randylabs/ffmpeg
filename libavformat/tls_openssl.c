@@ -21,6 +21,7 @@
  */
 
 #include "libavutil/mem.h"
+#include "libavutil/lfg.h"
 #include "network.h"
 #include "os_support.h"
 #include "libavutil/random_seed.h"
@@ -415,6 +416,301 @@ static X509 *cert_from_pem_string(const char *pem_str)
     return cert;
 }
 
+/**
+ * Shuffle an array of strings using Fisher-Yates algorithm with AVLFG.
+ *
+ * @param arr   Array of string pointers to shuffle
+ * @param count Number of elements in the array
+ * @param lfg   Initialized AVLFG state for random number generation
+ */
+static void shuffle_string_array(char **arr, int count, AVLFG *lfg)
+{
+    for (int i = count - 1; i > 0; i--) {
+        int j = av_lfg_get(lfg) % (i + 1);
+        char *tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+}
+
+/**
+ * Parse a colon-separated string into an array of strings.
+ *
+ * @param input      Colon-separated string (e.g., "A:B:C")
+ * @param arr        Output array of string pointers (caller must free with free_string_array)
+ * @param count      Output number of elements
+ * @return           0 on success, negative AVERROR on failure
+ */
+static int parse_colon_list(const char *input, char ***arr, int *count)
+{
+    int n = 0;
+    const char *p = input;
+    char **result = NULL;
+    char *input_copy = NULL;
+    char *token, *saveptr;
+
+    if (!input || !input[0]) {
+        *arr = NULL;
+        *count = 0;
+        return 0;
+    }
+
+    /* Count elements */
+    while (*p) {
+        if (*p == ':')
+            n++;
+        p++;
+    }
+    n++; /* number of elements = colons + 1 */
+
+    result = av_calloc(n, sizeof(char *));
+    if (!result)
+        return AVERROR(ENOMEM);
+
+    input_copy = av_strdup(input);
+    if (!input_copy) {
+        av_free(result);
+        return AVERROR(ENOMEM);
+    }
+
+    n = 0;
+    token = av_strtok(input_copy, ":", &saveptr);
+    while (token) {
+        result[n] = av_strdup(token);
+        if (!result[n]) {
+            for (int i = 0; i < n; i++)
+                av_free(result[i]);
+            av_free(result);
+            av_free(input_copy);
+            return AVERROR(ENOMEM);
+        }
+        n++;
+        token = av_strtok(NULL, ":", &saveptr);
+    }
+
+    av_free(input_copy);
+    *arr = result;
+    *count = n;
+    return 0;
+}
+
+/**
+ * Join an array of strings with colons.
+ *
+ * @param arr    Array of string pointers
+ * @param count  Number of elements
+ * @param output Output string (caller must av_free)
+ * @return       0 on success, negative AVERROR on failure
+ */
+static int join_colon_list(char **arr, int count, char **output)
+{
+    AVBPrint bp;
+    int ret;
+
+    av_bprint_init(&bp, 256, AV_BPRINT_SIZE_UNLIMITED);
+
+    for (int i = 0; i < count; i++) {
+        if (i > 0)
+            av_bprintf(&bp, ":");
+        av_bprintf(&bp, "%s", arr[i]);
+    }
+
+    ret = av_bprint_finalize(&bp, output);
+    return ret;
+}
+
+/**
+ * Free an array of strings allocated by parse_colon_list.
+ *
+ * @param arr   Array of string pointers
+ * @param count Number of elements
+ */
+static void free_string_array(char **arr, int count)
+{
+    if (!arr)
+        return;
+    for (int i = 0; i < count; i++)
+        av_free(arr[i]);
+    av_free(arr);
+}
+
+/**
+ * Configure TLS fingerprint parameters on an SSL_CTX.
+ *
+ * This function allows customization and randomization of TLS fingerprint
+ * parameters including cipher suites, elliptic curve groups, and signature
+ * algorithms. Randomization helps avoid TLS fingerprinting techniques like
+ * JA3/JA4.
+ *
+ * @param h   URLContext for logging
+ * @param ctx SSL_CTX to configure
+ * @param s   TLSShared containing fingerprint options
+ * @return    0 on success, negative AVERROR on failure
+ */
+static int openssl_configure_fingerprint(URLContext *h, SSL_CTX *ctx, TLSShared *s)
+{
+    AVLFG lfg;
+    int ret = 0;
+    uint32_t seed;
+    int randomize_ciphers = (s->fp_randomize == 1 || s->fp_randomize == 3 || s->fp_randomize == 4);
+    int randomize_groups  = (s->fp_randomize == 2 || s->fp_randomize == 3 || s->fp_randomize == 4);
+    int randomize_sigalgs = (s->fp_randomize == 4);
+
+    /* Initialize random seed */
+    if (s->fp_seed < 0) {
+        seed = av_get_random_seed();
+    } else {
+        seed = (uint32_t)s->fp_seed;
+    }
+    av_lfg_init(&lfg, seed);
+
+    av_log(h, AV_LOG_DEBUG, "TLS fingerprint config: randomize=%d seed=%u\n",
+           s->fp_randomize, seed);
+
+    /* Configure TLS 1.2 ciphers */
+    if (s->ciphers) {
+        char **arr = NULL;
+        int count = 0;
+        char *shuffled = NULL;
+
+        ret = parse_colon_list(s->ciphers, &arr, &count);
+        if (ret < 0)
+            return ret;
+
+        if (count > 0) {
+            if (randomize_ciphers)
+                shuffle_string_array(arr, count, &lfg);
+
+            ret = join_colon_list(arr, count, &shuffled);
+            free_string_array(arr, count);
+            if (ret < 0)
+                return ret;
+
+            av_log(h, AV_LOG_DEBUG, "Setting TLS 1.2 ciphers: %s\n", shuffled);
+            if (SSL_CTX_set_cipher_list(ctx, shuffled) != 1) {
+                av_log(h, AV_LOG_ERROR, "Failed to set cipher list: %s\n", shuffled);
+                av_free(shuffled);
+                return AVERROR(EINVAL);
+            }
+            av_free(shuffled);
+        } else {
+            free_string_array(arr, count);
+        }
+    }
+
+    /* Configure TLS 1.3 ciphersuites (OpenSSL 1.1.1+) */
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    if (s->ciphersuites) {
+        char **arr = NULL;
+        int count = 0;
+        char *shuffled = NULL;
+
+        ret = parse_colon_list(s->ciphersuites, &arr, &count);
+        if (ret < 0)
+            return ret;
+
+        if (count > 0) {
+            if (randomize_ciphers)
+                shuffle_string_array(arr, count, &lfg);
+
+            ret = join_colon_list(arr, count, &shuffled);
+            free_string_array(arr, count);
+            if (ret < 0)
+                return ret;
+
+            av_log(h, AV_LOG_DEBUG, "Setting TLS 1.3 ciphersuites: %s\n", shuffled);
+            if (SSL_CTX_set_ciphersuites(ctx, shuffled) != 1) {
+                av_log(h, AV_LOG_ERROR, "Failed to set TLS 1.3 ciphersuites: %s\n", shuffled);
+                av_free(shuffled);
+                return AVERROR(EINVAL);
+            }
+            av_free(shuffled);
+        } else {
+            free_string_array(arr, count);
+        }
+    }
+#else
+    if (s->ciphersuites) {
+        av_log(h, AV_LOG_WARNING, "TLS 1.3 ciphersuites require OpenSSL 1.1.1+, ignoring\n");
+    }
+#endif
+
+    /* Configure elliptic curve groups (OpenSSL 1.1.0+) */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    if (s->groups) {
+        char **arr = NULL;
+        int count = 0;
+        char *shuffled = NULL;
+
+        ret = parse_colon_list(s->groups, &arr, &count);
+        if (ret < 0)
+            return ret;
+
+        if (count > 0) {
+            if (randomize_groups)
+                shuffle_string_array(arr, count, &lfg);
+
+            ret = join_colon_list(arr, count, &shuffled);
+            free_string_array(arr, count);
+            if (ret < 0)
+                return ret;
+
+            av_log(h, AV_LOG_DEBUG, "Setting groups: %s\n", shuffled);
+            if (SSL_CTX_set1_groups_list(ctx, shuffled) != 1) {
+                av_log(h, AV_LOG_ERROR, "Failed to set groups: %s\n", shuffled);
+                av_free(shuffled);
+                return AVERROR(EINVAL);
+            }
+            av_free(shuffled);
+        } else {
+            free_string_array(arr, count);
+        }
+    }
+#else
+    if (s->groups) {
+        av_log(h, AV_LOG_WARNING, "Elliptic curve groups require OpenSSL 1.1.0+, ignoring\n");
+    }
+#endif
+
+    /* Configure signature algorithms (OpenSSL 1.0.2+) */
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+    if (s->sigalgs) {
+        char **arr = NULL;
+        int count = 0;
+        char *shuffled = NULL;
+
+        ret = parse_colon_list(s->sigalgs, &arr, &count);
+        if (ret < 0)
+            return ret;
+
+        if (count > 0) {
+            if (randomize_sigalgs)
+                shuffle_string_array(arr, count, &lfg);
+
+            ret = join_colon_list(arr, count, &shuffled);
+            free_string_array(arr, count);
+            if (ret < 0)
+                return ret;
+
+            av_log(h, AV_LOG_DEBUG, "Setting sigalgs: %s\n", shuffled);
+            if (SSL_CTX_set1_sigalgs_list(ctx, shuffled) != 1) {
+                av_log(h, AV_LOG_ERROR, "Failed to set sigalgs: %s\n", shuffled);
+                av_free(shuffled);
+                return AVERROR(EINVAL);
+            }
+            av_free(shuffled);
+        } else {
+            free_string_array(arr, count);
+        }
+    }
+#else
+    if (s->sigalgs) {
+        av_log(h, AV_LOG_WARNING, "Signature algorithms require OpenSSL 1.0.2+, ignoring\n");
+    }
+#endif
+
+    return 0;
+}
 
 typedef struct TLSContext {
     TLSShared tls_shared;
@@ -761,6 +1057,13 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
         goto fail;
     }
 
+    /* Configure TLS fingerprint parameters if any are specified */
+    if (s->ciphers || s->ciphersuites || s->groups || s->sigalgs || s->fp_randomize > 0) {
+        ret = openssl_configure_fingerprint(h, c->ctx, s);
+        if (ret < 0)
+            goto fail;
+    }
+
     ret = openssl_init_ca_key_cert(h);
     if (ret < 0) goto fail;
 
@@ -864,6 +1167,13 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         av_log(h, AV_LOG_ERROR, "Failed to set minimum TLS version to TLSv1\n");
         ret = AVERROR_EXTERNAL;
         goto fail;
+    }
+
+    /* Configure TLS fingerprint parameters if any are specified */
+    if (s->ciphers || s->ciphersuites || s->groups || s->sigalgs || s->fp_randomize > 0) {
+        ret = openssl_configure_fingerprint(h, c->ctx, s);
+        if (ret < 0)
+            goto fail;
     }
 
     /* Set ALPN protocols if specified */
